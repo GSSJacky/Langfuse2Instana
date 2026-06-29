@@ -43,6 +43,7 @@ class SourceConfig:
     service_name: str = "langfuse-app"
     environment: Optional[str] = None
     max_traces_per_poll: int = 100
+    max_observations_per_poll: int = 1000
     include_io: bool = False
     project_id: Optional[str] = None
 
@@ -105,6 +106,11 @@ def load_config(config_path: str) -> AppConfig:
             service_name=src.get("service_name", "langfuse-app"),
             environment=src.get("environment"),
             max_traces_per_poll=src.get("max_traces_per_poll", 100),
+            # Observation-based polling cap; default to the trace cap so existing
+            # configs that only set max_traces_per_poll keep an equivalent bound.
+            max_observations_per_poll=src.get(
+                "max_observations_per_poll", src.get("max_traces_per_poll", 1000)
+            ),
             include_io=src.get("include_io", False),
             project_id=src.get("project_id"),
         ))

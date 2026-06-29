@@ -31,7 +31,7 @@ Designed and validated with **IBM watsonx Orchestrate (WXO) ADK Developer Editio
 - **Instana-aware SpanKind** — root spans are promoted to `SERVER` so Instana correctly identifies entry calls and builds service dashboards
 - **GenAI semantic conventions** — maps Langfuse GENERATION observations to OTel `gen_ai.*` attributes (model, tokens, cost)
 - **Metrics export** — token usage, cost, and latency metrics via OTLP metrics protocol
-- **Deduplication** — SQLite-based state tracking to avoid re-exporting traces across restarts
+- **Observation-level polling & dedup** — polls by *observation* start time and re-exports the parent trace idempotently, so turns appended to a long-lived session trace are still captured; SQLite state tracking dedups across restarts and avoids double-counting metrics
 - **Windows Service ready** — graceful shutdown on `SIGBREAK`/`SIGINT`/`SIGTERM`; works with NSSM
 - **Containerized** — Docker and docker-compose ready
 
@@ -39,7 +39,14 @@ Designed and validated with **IBM watsonx Orchestrate (WXO) ADK Developer Editio
 
 ## Quick Start
 
-### 1. Install
+### 1. Clone
+
+```bash
+git clone https://github.com/GSSJacky/Langfuse2Instana.git
+cd Langfuse2Instana
+```
+
+### 2. Install
 
 ```bash
 python -m venv venv
@@ -47,14 +54,14 @@ source venv/bin/activate        # Windows: venv\Scripts\Activate.ps1
 pip install .
 ```
 
-### 2. Configure
+### 3. Configure
 
 ```bash
 cp config.yaml.example config.yaml
 # Edit config.yaml with your Langfuse and Instana credentials
 ```
 
-### 3. Run
+### 4. Run
 
 ```bash
 langfuse2instana -c config.yaml
@@ -91,9 +98,14 @@ This walks through installing the service directly on a **Windows Server 2022** 
 - Outbound HTTPS to Langfuse and Instana OTLP endpoint (no inbound ports needed for polling-only mode)
 - [NSSM](https://nssm.cc/download) (optional, for Windows Service)
 
-### Step 1 — Copy the project
+### Step 1 — Get the project
 
-Place the project folder at `C:\langfuse2instana`. The directory must contain `pyproject.toml` and `src\`.
+Clone the repo (or copy the folder) to `C:\langfuse2instana`. The directory must contain `pyproject.toml` and `src\`.
+
+```powershell
+git clone https://github.com/GSSJacky/Langfuse2Instana.git C:\langfuse2instana
+cd C:\langfuse2instana
+```
 
 ### Step 2 — Create venv and install
 
@@ -104,11 +116,37 @@ python -m venv venv
 pip install .
 ```
 
+Verify the launcher was created:
+
+```powershell
+.\venv\Scripts\langfuse2instana.exe --help
+```
+
 > ⚠️ Always run `python -m venv venv` **in the project directory** before `pip install .`.
 > Copying a venv from another location will embed the old Python path in the `.exe` launcher and cause:
 > `Fatal error in launcher: Unable to create process using '...\python.exe'`
 
 > If `Activate.ps1` is blocked: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+
+**Clean rebuild** (e.g. after the launcher error above, or to reinstall after pulling new code) — delete the venv and recreate it from scratch:
+
+```powershell
+# 1. remove the old venv
+Remove-Item -Recurse -Force C:\langfuse2instana\venv
+
+# 2. create a fresh venv
+cd C:\langfuse2instana
+python -m venv venv
+
+# 3. activate (cmd.exe shown; PowerShell: .\venv\Scripts\Activate.ps1)
+.\venv\Scripts\Activate.bat
+
+# 4. reinstall
+pip install .
+
+# 5. verify
+.\venv\Scripts\langfuse2instana.exe --help
+```
 
 ### Step 3 — Configure
 
@@ -259,7 +297,7 @@ WXO_MCSP_URL=https://iam.platform.saas.ibm.com
 | Service visible but metrics empty in Service screen | OTLP metrics go to Custom Dashboards, not Service screen | Create a Custom Dashboard with `langfuse.*` metrics |
 | `WXO_AUTH_TYPE must be one of ['bearer','cpd','ibm_iam']` | Old version of `wxo-otel-forwarder` installed | Copy updated `config.py` and `auth.py` from source; run `pip install -e .` |
 | Traces show as `INTERNAL` only, service not created in Instana | Root span `SpanKind` was `INTERNAL` | Fixed in this version: single natural root span is promoted to `SERVER` automatically |
-| Langfuse traces only appear in Observations tab, not Traces tab | WXO appends to existing session trace | Start a **new chat session** (new browser tab / refresh) to generate a new trace ID |
+| New turns appear only in Langfuse **Observations** tab, with no new row in the **Traces** tab | WXO appends each turn as new observations onto the existing long-lived **session** trace | Handled automatically: the service polls by **observation start time** and idempotently re-exports the parent trace, so appended turns still reach Instana. (Starting a new chat session also creates a fresh trace ID.) |
 
 ---
 

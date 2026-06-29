@@ -60,12 +60,14 @@ class SourcePoller:
         checkpoint = self.state.get_checkpoint(self.source.name)
 
         now = datetime.now(timezone.utc)
-        # Always re-scan at least the last `lookback_minutes` window so that
-        # traces that arrived in Langfuse after their start timestamp (ingestion
-        # lag) are still picked up. Deduplication (state store) prevents
-        # re-exporting traces we already sent. If the checkpoint is older than
-        # the lookback window (e.g. we were down for a while), extend the window
-        # back to the checkpoint to catch up.
+        # Poll by *observation* start time (not trace start time). WxO maps a
+        # whole conversation session to one long-lived trace and appends each
+        # turn as new observations over hours; a trace-list poll filtered by
+        # trace start time would drop those appended turns once the trace fell
+        # out of the lookback window. Always re-scan at least the last
+        # `lookback_minutes` to absorb ingestion lag; observation-level dedup
+        # prevents re-exporting what we already sent. If the checkpoint is older
+        # than the lookback window (e.g. downtime), extend back to it to catch up.
         lookback_start = now - timedelta(minutes=self.source.lookback_minutes)
         from_dt = lookback_start
         if checkpoint:
@@ -80,109 +82,115 @@ class SourcePoller:
         from_time = from_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         to_time = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-        logger.info("[%s] Polling traces from %s to %s", self.source.name, from_time, to_time)
+        logger.info("[%s] Polling observations from %s to %s", self.source.name, from_time, to_time)
 
-        traces_summary = self.client.fetch_all_traces(
-            from_timestamp=from_time,
-            to_timestamp=to_time,
-            max_traces=self.source.max_traces_per_poll,
+        observations = self.client.fetch_recent_observations(
+            from_start_time=from_time,
+            to_start_time=to_time,
+            max_observations=self.source.max_observations_per_poll,
         )
 
-        if not traces_summary:
-            logger.debug("[%s] No new traces found", self.source.name)
+        if not observations:
+            logger.debug("[%s] No observations in window", self.source.name)
             self.state.set_checkpoint(self.source.name, to_time)
             return
 
-        new_traces = []
-        for t in traces_summary:
-            trace_id = t.get("id", "")
-            if not self.state.is_trace_exported(trace_id, self.source.name):
-                new_traces.append(t)
+        obs_ids = [o.get("id", "") for o in observations]
+        new_obs_ids = self.state.filter_new_observation_ids(obs_ids, self.source.name)
 
-        if not new_traces:
-            logger.debug("[%s] All %d traces already exported", self.source.name, len(traces_summary))
+        if not new_obs_ids:
+            logger.debug("[%s] All %d observations already exported", self.source.name, len(observations))
             self.state.set_checkpoint(self.source.name, to_time)
             return
 
-        logger.info("[%s] Found %d new traces to export", self.source.name, len(new_traces))
+        # Distinct parent traces that gained new observations -> (re-)export.
+        affected_trace_ids = []
+        seen = set()
+        for o in observations:
+            if o.get("id") in new_obs_ids:
+                tid = o.get("traceId")
+                if tid and tid not in seen:
+                    seen.add(tid)
+                    affected_trace_ids.append(tid)
 
-        exported_ids = []
-        full_traces = []
+        logger.info(
+            "[%s] Found %d new observations across %d traces to export",
+            self.source.name, len(new_obs_ids), len(affected_trace_ids),
+        )
 
-        for trace_summary in new_traces:
-            trace_id = trace_summary.get("id", "")
+        exported = 0
+        for trace_id in affected_trace_ids:
             try:
                 trace_data = self.client.fetch_trace_with_observations(trace_id)
-                full_traces.append(trace_data)
-
-                otlp_data = convert_trace_to_otlp(
-                    trace_data=trace_data,
-                    service_name=self.source.service_name,
-                    source_name=self.source.name,
-                    environment=self.source.environment,
-                    include_io=self.source.include_io,
-                )
-
-                if otlp_data:
-                    success = self.exporter.export_traces(otlp_data)
-                    if success:
-                        exported_ids.append(trace_id)
-                        logger.info("[%s] Exported trace %s", self.source.name, trace_id)
-                    else:
-                        logger.warning("[%s] Failed to export trace %s", self.source.name, trace_id)
-                else:
-                    exported_ids.append(trace_id)
-                    logger.debug("[%s] Trace %s has no spans, marked as exported", self.source.name, trace_id)
-
+                if self._export_trace(trace_data):
+                    exported += 1
             except Exception as e:
                 logger.error("[%s] Error processing trace %s: %s", self.source.name, trace_id, e)
 
-        if exported_ids:
-            self.state.mark_traces_exported(exported_ids, self.source.name)
+        self.state.set_checkpoint(self.source.name, to_time)
+        logger.info(
+            "[%s] Poll complete: %d/%d traces (re-)exported",
+            self.source.name, exported, len(affected_trace_ids),
+        )
 
-        if self.metrics_enabled and full_traces:
+    def _export_trace(self, trace_data: dict) -> bool:
+        """Convert and export a full trace, then export metrics for and record
+        only its *new* observations.
+
+        Re-exporting the full trace is idempotent for spans (span IDs are a
+        deterministic hash of the observation ID, so Instana de-dupes by
+        traceId+spanId). Metrics, however, are delta sums, so they are computed
+        from new observations only to avoid double counting on re-export.
+        """
+        trace_id = trace_data.get("id", "")
+        all_obs = trace_data.get("observations", []) or []
+        all_obs_ids = [o.get("id", "") for o in all_obs if o.get("id")]
+
+        # Determine which observations are genuinely new before we mark anything.
+        new_ids = self.state.filter_new_observation_ids(all_obs_ids, self.source.name)
+
+        otlp_data = convert_trace_to_otlp(
+            trace_data=trace_data,
+            service_name=self.source.service_name,
+            source_name=self.source.name,
+            environment=self.source.environment,
+            include_io=self.source.include_io,
+        )
+
+        if otlp_data:
+            if not self.exporter.export_traces(otlp_data):
+                logger.warning("[%s] Failed to export trace %s", self.source.name, trace_id)
+                return False  # not marked -> retried next poll
+            logger.info("[%s] Exported trace %s (%d new obs)", self.source.name, trace_id, len(new_ids))
+        else:
+            logger.debug("[%s] Trace %s has no observations yet", self.source.name, trace_id)
+
+        if self.metrics_enabled and new_ids:
             try:
+                new_trace_view = dict(trace_data)
+                new_trace_view["observations"] = [o for o in all_obs if o.get("id") in new_ids]
                 metrics_data = extract_metrics_from_traces(
-                    full_traces, self.source.service_name, self.source.name
+                    [new_trace_view], self.source.service_name, self.source.name
                 )
                 otlp_metrics = metrics_to_otlp(metrics_data)
                 if otlp_metrics:
                     self.exporter.export_metrics(otlp_metrics)
-                    logger.info("[%s] Exported metrics for %d traces", self.source.name, len(full_traces))
+                    logger.info("[%s] Exported metrics for trace %s", self.source.name, trace_id)
             except Exception as e:
-                logger.error("[%s] Error exporting metrics: %s", self.source.name, e)
+                logger.error("[%s] Error exporting metrics for trace %s: %s", self.source.name, trace_id, e)
 
-        self.state.set_checkpoint(self.source.name, to_time)
-        logger.info(
-            "[%s] Poll complete: %d/%d traces exported",
-            self.source.name, len(exported_ids), len(new_traces),
-        )
+        # Record all of the trace's observations so unchanged ones don't trigger
+        # re-export; the next genuinely new observation (next turn) won't be in
+        # this set and will trigger another (idempotent) export.
+        if all_obs_ids:
+            self.state.mark_observations_exported(all_obs_ids, self.source.name)
+
+        return True
 
     def process_single_trace(self, trace_id: str) -> bool:
         try:
             trace_data = self.client.fetch_trace_with_observations(trace_id)
-            otlp_data = convert_trace_to_otlp(
-                trace_data=trace_data,
-                service_name=self.source.service_name,
-                source_name=self.source.name,
-                environment=self.source.environment,
-                include_io=self.source.include_io,
-            )
-            if otlp_data:
-                success = self.exporter.export_traces(otlp_data)
-                if success:
-                    self.state.mark_trace_exported(trace_id, self.source.name)
-                    logger.info("[%s] Exported trace %s (webhook)", self.source.name, trace_id)
-
-                    metrics_data = extract_metrics_from_traces(
-                        [trace_data], self.source.service_name, self.source.name,
-                    )
-                    otlp_metrics = metrics_to_otlp(metrics_data)
-                    if otlp_metrics:
-                        self.exporter.export_metrics(otlp_metrics)
-
-                    return True
-            return False
+            return self._export_trace(trace_data)
         except Exception as e:
             logger.error("[%s] Error processing trace %s: %s", self.source.name, trace_id, e)
             return False

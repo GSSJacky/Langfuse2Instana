@@ -27,6 +27,14 @@ class StateStore:
                     )
                 """)
                 conn.execute("""
+                    CREATE TABLE IF NOT EXISTS exported_observations (
+                        observation_id TEXT NOT NULL,
+                        source_name TEXT NOT NULL,
+                        exported_at TEXT NOT NULL,
+                        PRIMARY KEY (observation_id, source_name)
+                    )
+                """)
+                conn.execute("""
                     CREATE TABLE IF NOT EXISTS checkpoints (
                         source_name TEXT PRIMARY KEY,
                         last_timestamp TEXT NOT NULL,
@@ -36,6 +44,10 @@ class StateStore:
                 conn.execute("""
                     CREATE INDEX IF NOT EXISTS idx_exported_traces_exported_at
                     ON exported_traces(exported_at)
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_exported_observations_exported_at
+                    ON exported_observations(exported_at)
                 """)
                 conn.commit()
             finally:
@@ -79,6 +91,52 @@ class StateStore:
             finally:
                 conn.close()
 
+    def filter_new_observation_ids(self, observation_ids: list[str], source_name: str) -> set[str]:
+        """Return the subset of observation_ids that have not been exported yet.
+
+        Used to drive observation-level deduplication: only genuinely new
+        observations trigger a (re-)export of their parent trace, and only new
+        observations are counted toward metrics (avoiding double counting on
+        re-export of long-lived traces).
+        """
+        ids = [oid for oid in observation_ids if oid]
+        if not ids:
+            return set()
+        new_ids = set(ids)
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                # Chunk to stay well under SQLite's variable limit.
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    cursor = conn.execute(
+                        f"SELECT observation_id FROM exported_observations "
+                        f"WHERE source_name = ? AND observation_id IN ({placeholders})",
+                        (source_name, *chunk),
+                    )
+                    for (existing,) in cursor.fetchall():
+                        new_ids.discard(existing)
+                return new_ids
+            finally:
+                conn.close()
+
+    def mark_observations_exported(self, observation_ids: list[str], source_name: str):
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [(oid, source_name, now) for oid in observation_ids if oid]
+        if not rows:
+            return
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO exported_observations (observation_id, source_name, exported_at) VALUES (?, ?, ?)",
+                    rows,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
     def get_checkpoint(self, source_name: str) -> Optional[str]:
         with self._lock:
             conn = sqlite3.connect(self.db_path)
@@ -115,8 +173,16 @@ class StateStore:
                     (cutoff,),
                 )
                 deleted = cursor.rowcount
+                obs_cursor = conn.execute(
+                    "DELETE FROM exported_observations WHERE exported_at < ?",
+                    (cutoff,),
+                )
+                deleted_obs = obs_cursor.rowcount
                 conn.commit()
-                if deleted > 0:
-                    logger.info("Cleaned up %d old trace entries", deleted)
+                if deleted > 0 or deleted_obs > 0:
+                    logger.info(
+                        "Cleaned up %d old trace entries and %d old observation entries",
+                        deleted, deleted_obs,
+                    )
             finally:
                 conn.close()

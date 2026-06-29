@@ -87,6 +87,8 @@ class LangfuseClient:
         page: int = 1,
         observation_type: Optional[str] = None,
         name: Optional[str] = None,
+        from_start_time: Optional[str] = None,
+        to_start_time: Optional[str] = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"limit": limit, "page": page}
         if trace_id:
@@ -95,6 +97,10 @@ class LangfuseClient:
             params["type"] = observation_type
         if name:
             params["name"] = name
+        if from_start_time:
+            params["fromStartTime"] = from_start_time
+        if to_start_time:
+            params["toStartTime"] = to_start_time
 
         resp = self._request("GET", "/observations", params=params)
         return resp.json()
@@ -133,6 +139,43 @@ class LangfuseClient:
             self.source.name, len(all_traces), from_timestamp, to_timestamp,
         )
         return all_traces[:max_traces]
+
+    def fetch_recent_observations(
+        self,
+        from_start_time: str,
+        to_start_time: str,
+        max_observations: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Fetch observations whose startTime falls in the window.
+
+        Polling is driven off observation start time (not trace start time) so
+        that observations appended to a long-lived trace are picked up even when
+        the trace itself started long before the current window.
+        """
+        all_obs = []
+        page = 1
+        page_size = min(max_observations, DEFAULT_PAGE_SIZE)
+
+        while len(all_obs) < max_observations:
+            result = self.list_observations(
+                from_start_time=from_start_time,
+                to_start_time=to_start_time,
+                limit=page_size,
+                page=page,
+            )
+            obs = result.get("data", [])
+            if not obs:
+                break
+            all_obs.extend(obs)
+            if len(obs) < page_size:
+                break
+            page += 1
+
+        logger.info(
+            "[%s] Fetched %d observations from %s to %s",
+            self.source.name, len(all_obs), from_start_time, to_start_time,
+        )
+        return all_obs[:max_observations]
 
     def fetch_trace_with_observations(self, trace_id: str) -> dict[str, Any]:
         trace = self.get_trace(trace_id)
