@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "langfuse2instana"
+version = "1.0.0"
+description = "General-purpose Langfuse to OTLP/Instana trace and metrics conversion service"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "requests>=2.31.0",
+    "pyyaml>=6.0",
+    "opentelemetry-proto>=1.20.0",
+    "protobuf>=4.21.0",
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.scripts]
+langfuse2instana = "langfuse2instana.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

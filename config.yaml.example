@@ -1,0 +1,71 @@
+# Langfuse2Instana Configuration
+# Copy this file to config.yaml and fill in your values.
+# Environment variables can be referenced with ${VAR_NAME} syntax.
+
+# Langfuse data sources (supports multiple instances)
+sources:
+  # Example: WXO Langfuse (SaaS)
+  - name: "wxo-langfuse"
+    langfuse_host: "https://cloud.langfuse.com"
+    public_key: "${LANGFUSE_PUBLIC_KEY}"
+    secret_key: "${LANGFUSE_SECRET_KEY}"
+    poll_interval_seconds: 60
+    lookback_minutes: 5
+    service_name: "wxo-server"
+    environment: "production"
+    max_traces_per_poll: 100
+    # Set to true to include input/output data in spans (can be large)
+    include_io: false
+    # Optional: Langfuse project ID. Used to route incoming webhooks to the
+    # correct source when multiple sources are configured.
+    # project_id: "cmxxxxxxxx"
+
+  # Example: On-prem Langfuse
+  # - name: "onprem-langfuse"
+  #   langfuse_host: "https://langfuse.internal.company.com"
+  #   public_key: "pk-lf-xxx"
+  #   secret_key: "sk-lf-xxx"
+  #   poll_interval_seconds: 30
+  #   lookback_minutes: 5
+  #   service_name: "my-llm-app"
+  #   environment: "staging"
+
+# OTLP export configuration
+export:
+  # Instana OTLP endpoint (or any OTel-compatible backend)
+  endpoint: "${OTLP_ENDPOINT}"
+  # Protocol: "http/protobuf" (recommended) or "http/json"
+  protocol: "http/protobuf"
+  # Custom headers (e.g., Instana API key)
+  headers:
+    x-instana-key: "${INSTANA_KEY}"
+  # Set to true to skip TLS verification
+  insecure: false
+  timeout_seconds: 30
+  max_retries: 3
+
+# Webhook receiver (optional, for near-real-time export)
+webhook:
+  enabled: false
+  host: "0.0.0.0"
+  port: 8000
+  # Langfuse webhook signing secret (optional). Accepts the Svix-style secret
+  # Langfuse generates (e.g. "whsec_..."); verified via the svix-* headers.
+  # A non-Svix value is treated as a raw HMAC-SHA256 shared secret checked
+  # against the x-langfuse-signature header.
+  # secret: "${WEBHOOK_SECRET}"
+
+# State management (dedup and checkpointing)
+state:
+  # SQLite database path for tracking exported traces
+  db_path: "./state.db"
+  # Auto-cleanup entries older than N days
+  retention_days: 7
+
+# Metrics export
+metrics:
+  enabled: true
+  export_interval_seconds: 60
+
+# Logging level: DEBUG, INFO, WARNING, ERROR
+log_level: "INFO"

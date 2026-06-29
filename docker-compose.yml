@@ -1,0 +1,19 @@
+services:
+  langfuse2instana:
+    build: .
+    container_name: langfuse2instana
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    environment:
+      # Langfuse credentials
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      # OTLP/Instana endpoint
+      - OTLP_ENDPOINT=${OTLP_ENDPOINT}
+      - INSTANA_KEY=${INSTANA_KEY}
+      # Optional: webhook secret
+      # - WEBHOOK_SECRET=${WEBHOOK_SECRET}
